@@ -138,6 +138,30 @@ generate_poi_json() {
     echo "POI JSON generated successfully"
 }
 
+
+resolve_place_coordinates() {
+    local place="$1"
+    local coords
+
+    if ! curl -fLsS --connect-timeout 8 --max-time 20 -G \
+        -A "INFO1112-A2-Student/1.0 (https://github.com/abc3381852217-jpg/INFO1112-A2)" \
+        --data-urlencode "q=$place" \
+        --data-urlencode "format=jsonv2" \
+        --data-urlencode "limit=1" \
+        -o /tmp/place_search.json \
+        "https://nominatim.openstreetmap.org/search"; then
+        echo "Error: Cannot search place name" >&2
+        return 1
+    fi
+
+    coords=$(jq -er '.[0] | select(.lat != null and .lon != null) | "\(.lat) \(.lon)"' /tmp/place_search.json) || {
+        echo "Error: Place not found" >&2
+        return 1
+    }
+
+    echo "$coords"
+}
+
 if [ -z "$server_ip" ]; then
     echo "Error: Cannot find server IP"
     exit 1
@@ -174,19 +198,42 @@ elif [ "$request" = "population" ]; then
     fi
 
 
+
 elif [[ "$request" == poi\ * ]]; then
     echo "Processing POI request..."
 
-    read -r command latitude longitude extra <<< "$request"
+    read -r command arg1 arg2 extra <<< "$request"
 
-    if [ -z "$latitude" ] || [ -z "$longitude" ] || [ -n "$extra" ]; then
-        echo "Error: Use poi latitude longitude" >&"${CLIENT[1]}"
+    latitude=""
+    longitude=""
 
-    elif generate_poi_json "$latitude" "$longitude"; then
-        cat /root/poi.json >&"${CLIENT[1]}"
+    if [ -z "$arg1" ]; then
+        echo "Error: Use poi latitude longitude or poi place name" >&"${CLIENT[1]}"
+
+    elif [[ "$arg1" =~ ^-?[0-9]+([.][0-9]+)?$ ]]; then
+        if [[ "$arg2" =~ ^-?[0-9]+([.][0-9]+)?$ ]] && [ -z "$extra" ]; then
+            latitude="$arg1"
+            longitude="$arg2"
+        else
+            echo "Error: Use poi latitude longitude" >&"${CLIENT[1]}"
+        fi
 
     else
-        echo "Error: Failed to generate POI JSON" >&"${CLIENT[1]}"
+        place="${request#poi }"
+
+        if coords=$(resolve_place_coordinates "$place"); then
+            read -r latitude longitude <<< "$coords"
+        else
+            echo "Error: Place not found" >&"${CLIENT[1]}"
+        fi
+    fi
+
+    if [ -n "$latitude" ] && [ -n "$longitude" ]; then
+        if generate_poi_json "$latitude" "$longitude"; then
+            cat /root/poi.json >&"${CLIENT[1]}"
+        else
+            echo "Error: Failed to generate POI JSON" >&"${CLIENT[1]}"
+        fi
     fi
 
 else
