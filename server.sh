@@ -38,6 +38,54 @@ generate_assignment_json() {
 }
 server_ip=$(ifconfig eth0 | awk '/inet / {print $2}')
 
+generate_population_png() {
+    local csv_file="/tmp/STE_1.csv"
+    local data_file="/tmp/nsw_population_years.csv"
+    local output_file="/root/population.png"
+
+    if ! curl -fLsS -o "$csv_file" \
+        "https://dbr.abs.gov.au/processedData/csv/STE_1.csv"; then
+        echo "Error: Cannot download population CSV"
+        return 1
+    fi
+
+    awk -F',' '
+    NR==1 {
+        for(i=4;i<=NF;i++) {
+            gsub(/\r/,"",$i)
+            year[i]=$i
+        }
+    }
+    $1=="ERP_P_20" {
+        for(i=4;i<=NF;i++) {
+            gsub(/\r/,"",$i)
+            if(year[i] ~ /^[0-9][0-9][0-9][0-9]$/ && $i ~ /^[0-9]+$/)
+                print year[i] "," $i
+        }
+    }' "$csv_file" > "$data_file"
+
+    local population
+    population=$(awk -F',' '$1=="2025" {print $2}' "$data_file")
+
+    if [ -z "$population" ]; then
+        echo "Error: Cannot find 2025 NSW population"
+        return 1
+    fi
+
+    echo "NSW Population 2025: $population"
+
+    if ! python3 /root/plot_population.py "$data_file" "$output_file"; then
+        echo "Error: Cannot generate population plot"
+        return 1
+    fi
+
+    if [ ! -s "$output_file" ]; then
+        echo "Error: Population image is missing"
+        return 1
+    fi
+}
+
+
 if [ -z "$server_ip" ]; then
     echo "Error: Cannot find server IP"
     exit 1
@@ -49,22 +97,34 @@ while true
 do
     echo "Waiting for client..."
 
-    coproc CLIENT { nc -v -l 1234; }
+    coproc CLIENT { nc -N -v -l 1234; }
 
     if IFS= read -r request <&"${CLIENT[0]}"; then
         echo "Received request: $request"
 
-        if [ "$request" = "assignment" ]; then
-            echo "Processing assignment request..."
+        
+if [ "$request" = "assignment" ]; then
+    echo "Processing assignment request..."
 
-            if generate_assignment_json; then
-                cat /root/assignment.json >&"${CLIENT[1]}"
-            else
-                echo "Error: Failed to generate assignment JSON" >&"${CLIENT[1]}"
-            fi
-        else
-            echo "Error: Unknown request" >&"${CLIENT[1]}"
-        fi
+    if generate_assignment_json; then
+        cat /root/assignment.json >&"${CLIENT[1]}"
+    else
+        echo "Error: Failed to generate assignment JSON" >&"${CLIENT[1]}"
+    fi
+
+elif [ "$request" = "population" ]; then
+    echo "Processing population request..."
+
+    if generate_population_png; then
+        cat /root/population.png >&"${CLIENT[1]}"
+    else
+        echo "Error: Failed to generate population PNG" >&"${CLIENT[1]}"
+    fi
+
+else
+    echo "Error: Unknown request" >&"${CLIENT[1]}"
+fi
+
     fi
 
     exec {CLIENT[1]}>&-
