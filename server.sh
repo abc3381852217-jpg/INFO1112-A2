@@ -86,6 +86,58 @@ generate_population_png() {
 }
 
 
+generate_poi_json() {
+    local latitude="$1"
+    local longitude="$2"
+    local query
+
+    # Check coordinates
+    if ! [[ "$latitude" =~ ^-?[0-9]+(\.[0-9]+)?$ &&
+            "$longitude" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+        echo "Error: Invalid coordinates"
+        return 1
+    fi
+
+    if ! awk -v lat="$latitude" -v lon="$longitude" \
+        'BEGIN {exit !(lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180)}'; then
+        echo "Error: Coordinates out of range"
+        return 1
+    fi
+
+    # Find POIs within 500 metres
+    query="[out:json][timeout:10];node(around:500,${latitude},${longitude})[name];out 20;"
+    if ! curl -fLsS --max-time 45 \
+        -A "INFO1112-A2-POI-Demo/1.0" \
+        --data-urlencode "data=$query" \
+        -o /tmp/poi_raw.json \
+        "https://overpass.openstreetmap.fr/api/interpreter"; then
+        echo "Error: Cannot download POI data"
+        return 1
+    fi
+
+    # Convert data into a JSON list
+    if ! jq -e '
+        if (.elements | type) != "array" then
+            error("Missing POI data")
+        else
+            [.elements[] |
+                select(.tags.name != null) |
+                {
+                    name: .tags.name,
+                    latitude: (.lat // .center.lat),
+                    longitude: (.lon // .center.lon),
+                    type: .type
+                }
+            ]
+        end
+    ' /tmp/poi_raw.json > /root/poi.json; then
+        echo "Error: Cannot generate POI JSON"
+        return 1
+    fi
+
+    echo "POI JSON generated successfully"
+}
+
 if [ -z "$server_ip" ]; then
     echo "Error: Cannot find server IP"
     exit 1
@@ -119,6 +171,22 @@ elif [ "$request" = "population" ]; then
         cat /root/population.png >&"${CLIENT[1]}"
     else
         echo "Error: Failed to generate population PNG" >&"${CLIENT[1]}"
+    fi
+
+
+elif [[ "$request" == poi\ * ]]; then
+    echo "Processing POI request..."
+
+    read -r command latitude longitude extra <<< "$request"
+
+    if [ -z "$latitude" ] || [ -z "$longitude" ] || [ -n "$extra" ]; then
+        echo "Error: Use poi latitude longitude" >&"${CLIENT[1]}"
+
+    elif generate_poi_json "$latitude" "$longitude"; then
+        cat /root/poi.json >&"${CLIENT[1]}"
+
+    else
+        echo "Error: Failed to generate POI JSON" >&"${CLIENT[1]}"
     fi
 
 else
