@@ -105,7 +105,7 @@ generate_poi_json() {
     fi
 
     # Find POIs within 500 metres
-    query="[out:json][timeout:10];node(around:500,${latitude},${longitude})[name];out 20;"
+    query="[out:json][timeout:25];nwr(around:500,${latitude},${longitude})[name];out center;"
     if ! curl -fLsS --max-time 45 \
         -A "INFO1112-A2-POI-Demo/1.0" \
         --data-urlencode "data=$query" \
@@ -162,86 +162,132 @@ resolve_place_coordinates() {
     echo "$coords"
 }
 
+
+handle_client() {
+    local ip="${SOCAT_PEERADDR:-unknown}"
+    local safe_ip="${ip//[^a-zA-Z0-9]/_}"
+    local lock="/tmp/info1112_${safe_ip}.lock"
+    local request
+
+    if ! mkdir "$lock" 2>/dev/null; then
+        echo "Error: Client already connected"
+        return 0
+    fi
+
+    trap "rmdir '$lock' 2>/dev/null" EXIT
+
+    if ! IFS= read -r request; then
+        return 0
+    fi
+
+    echo "Client IP: $ip" >&2
+    echo "Received request: $request" >&2
+
+    if [ "$request" = "assignment" ]; then
+        echo "Processing assignment request..." >&2
+
+        if generate_assignment_json >&2; then
+            cat /root/assignment.json
+        else
+            echo "Error: Failed to generate assignment JSON"
+        fi
+
+    elif [ "$request" = "population" ]; then
+        echo "Processing population request..." >&2
+
+        if generate_population_png >&2; then
+            cat /root/population.png
+        else
+            echo "Error: Failed to generate population PNG"
+        fi
+
+    elif [[ "$request" == poi\ * ]]; then
+        echo "Processing POI request..." >&2
+
+        local command arg1 arg2 extra
+        local latitude="" longitude="" place coords
+
+        read -r command arg1 arg2 extra <<< "$request"
+
+        if [ -z "$arg1" ]; then
+            echo "Error: Use poi latitude longitude or poi place name"
+
+        elif [[ "$arg1" =~ ^-?[0-9]+([.][0-9]+)?$ ]]; then
+            if [[ "$arg2" =~ ^-?[0-9]+([.][0-9]+)?$ ]] && [ -z "$extra" ]; then
+                latitude="$arg1"
+                longitude="$arg2"
+            else
+                echo "Error: Use poi latitude longitude"
+            fi
+
+        else
+            place="${request#poi }"
+
+            if coords=$(resolve_place_coordinates "$place"); then
+                read -r latitude longitude <<< "$coords"
+            else
+                echo "Error: Place not found"
+            fi
+        fi
+
+        if [ -n "$latitude" ] && [ -n "$longitude" ]; then
+            if generate_poi_json "$latitude" "$longitude" >&2; then
+                cat /root/poi.json
+            else
+                echo "Error: Failed to generate POI JSON"
+            fi
+        fi
+
+    else
+        echo "Error: Unknown request"
+    fi
+}
+
+if [ "${1:-}" = "--client" ]; then
+    handle_client
+    exit 0
+fi
+
 if [ -z "$server_ip" ]; then
     echo "Error: Cannot find server IP"
     exit 1
 fi
 
-echo "The server is running at Link addr:$server_ip"
-
-while true
-do
-    echo "Waiting for client..."
-
-    coproc CLIENT { nc -N -v -l 1234; }
-
-    if IFS= read -r request <&"${CLIENT[0]}"; then
-        echo "Received request: $request"
-
-        
-if [ "$request" = "assignment" ]; then
-    echo "Processing assignment request..."
-
-    if generate_assignment_json; then
-        cat /root/assignment.json >&"${CLIENT[1]}"
-    else
-        echo "Error: Failed to generate assignment JSON" >&"${CLIENT[1]}"
-    fi
-
-elif [ "$request" = "population" ]; then
-    echo "Processing population request..."
-
-    if generate_population_png; then
-        cat /root/population.png >&"${CLIENT[1]}"
-    else
-        echo "Error: Failed to generate population PNG" >&"${CLIENT[1]}"
-    fi
-
-
-
-elif [[ "$request" == poi\ * ]]; then
-    echo "Processing POI request..."
-
-    read -r command arg1 arg2 extra <<< "$request"
-
-    latitude=""
-    longitude=""
-
-    if [ -z "$arg1" ]; then
-        echo "Error: Use poi latitude longitude or poi place name" >&"${CLIENT[1]}"
-
-    elif [[ "$arg1" =~ ^-?[0-9]+([.][0-9]+)?$ ]]; then
-        if [[ "$arg2" =~ ^-?[0-9]+([.][0-9]+)?$ ]] && [ -z "$extra" ]; then
-            latitude="$arg1"
-            longitude="$arg2"
-        else
-            echo "Error: Use poi latitude longitude" >&"${CLIENT[1]}"
-        fi
-
-    else
-        place="${request#poi }"
-
-        if coords=$(resolve_place_coordinates "$place"); then
-            read -r latitude longitude <<< "$coords"
-        else
-            echo "Error: Place not found" >&"${CLIENT[1]}"
-        fi
-    fi
-
-    if [ -n "$latitude" ] && [ -n "$longitude" ]; then
-        if generate_poi_json "$latitude" "$longitude"; then
-            cat /root/poi.json >&"${CLIENT[1]}"
-        else
-            echo "Error: Failed to generate POI JSON" >&"${CLIENT[1]}"
-        fi
-    fi
-
-else
-    echo "Error: Unknown request" >&"${CLIENT[1]}"
+if ! command -v socat >/dev/null 2>&1; then
+    echo "Error: socat is not installed"
+    exit 1
 fi
 
-    fi
 
-    exec {CLIENT[1]}>&-
-    wait "$CLIENT_PID"
-done
+echo "The server is running at Link addr:$server_ip"
+
+listen_port="${SERVER_PORT:-1234}"
+
+socat TCP-LISTEN:"$listen_port",reuseaddr,fork \
+    EXEC:"bash /root/server.sh --client" &
+
+listener_pid=$!
+
+trap 'kill "$listener_pid" 2>/dev/null; wait "$listener_pid" 2>/dev/null' EXIT
+
+sleep 1
+
+server_port=$(ss -ltn | awk -v port="$listen_port" '
+    NR > 1 {
+        n = split($4, parts, ":")
+        if (parts[n] == port) {
+            print parts[n]
+            exit
+        }
+    }
+')
+
+if [ -z "$server_port" ]; then
+    echo "Error: Cannot detect server port"
+    exit 1
+fi
+
+echo "Server listening on port: $server_port"
+echo "Waiting for client..."
+
+wait "$listener_pid"
